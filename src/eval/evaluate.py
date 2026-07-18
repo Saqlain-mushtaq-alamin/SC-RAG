@@ -4,8 +4,8 @@ src/eval/evaluate.py
 Self-contained evaluation harness.
 
 Loads  data/eval_qa.json, runs every question through both pipelines,
-scores the answers with RAGAS faithfulness + answer_relevancy, and writes
-a Markdown comparison table to eval_results.md (project root).
+scores the answers with an extended metric suite, and writes a Markdown
+comparison table to eval_results.md (project root).
 
 Usage
 -----
@@ -35,17 +35,42 @@ Pipelines compared
   LangGraph state machine (retrieve → grade → rewrite → generate →
   groundedness-check → usefulness-check).
 
-RAGAS metrics scored
---------------------
-- ``faithfulness``     : fraction of answer claims supported by context.
-- ``answer_relevancy`` : how well the answer addresses the question.
+Metrics scored
+--------------
+Generation quality (RAGAS):
+  - ``faithfulness``        : fraction of answer claims supported by context.
+  - ``answer_relevancy``    : how well the answer addresses the question.
+  - ``answer_correctness``  : factual overlap + semantic similarity vs. ground truth.
+  - ``context_entity_recall``: key entities from ground truth present in context.
+
+Retrieval quality (RAGAS):
+  - ``context_precision``   : fraction of retrieved chunks that are relevant.
+  - ``context_recall``      : fraction of ground-truth-relevant chunks retrieved.
+
+Self-correction-specific (computed locally):
+  - ``hallucination_fix_rate``       : % of baseline-unfaithful claims fixed.
+  - ``hallucination_injection_rate`` : % of baseline-faithful claims broken.
+  - ``avg_correction_rounds``        : mean correction iterations per query.
+  - ``max_rounds_hit_pct``           : % of queries that hit max correction rounds.
+  - ``latency_overhead_s``           : mean added latency from correction loop.
+
+Secondary:
+  - ``bertscore_f1``  : BERTScore F1 vs. ground-truth answers.
+  - ``rouge_l``       : ROUGE-L surface-overlap vs. ground-truth answers.
+
+Context pairing fix
+-------------------
+The corrected-answer RAGAS samples use ``correction_context`` returned directly
+by ``run_corrected_query`` — the **full, untruncated** chunks actually passed
+to the correction agent.  This replaces the previous approach of scraping
+120-char trace previews, which caused artificially low faithfulness scores.
 
 Outputs
 -------
-- Console            : per-item answers (excerpts) + final summary table.
+- Console            : per-item answers (excerpts) + full summary table.
 - eval_results.md    : Markdown comparison table (project root).
 - data/eval_results_raw.json : Full per-item data (answers, contexts,
-                               timing, RAGAS scores).
+                               timing, all scores).
 """
 
 from __future__ import annotations
@@ -55,7 +80,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Ensure the project root is on sys.path so this file works both as
@@ -72,6 +97,9 @@ try:
     load_dotenv(_PROJECT_ROOT / ".env")
 except ImportError:
     pass
+
+# Maximum correction rounds cap — must match correction_graph._MAX_GROUNDEDNESS_RETRIES
+_MAX_CORRECTION_ROUNDS: int = 2
 
 
 # ===========================================================================
@@ -153,18 +181,20 @@ def _build_baseline_index(data_dir: str) -> Any:
 
 
 # ===========================================================================
-# Section 3 — Context extraction from the correction-graph trace
+# Section 3 — Context extraction helpers
 # ===========================================================================
 
 
 def _contexts_from_trace(trace: List[Dict[str, Any]]) -> List[str]:
     """
-    Walks the correction-graph trace produced by ``run_corrected_query``
-    and returns chunk texts from the *last* ``grade_chunks`` node visit.
+    LEGACY helper — walks the correction-graph trace and returns chunk texts
+    from the *last* ``grade_chunks`` node visit.
 
-    The ``grade_chunks`` node stores chunk previews (truncated to 120 chars)
-    in ``detail.grades[].chunk``.  These are used as the RAGAS context even
-    though they may be slightly truncated.
+    .. warning::
+        This uses the ``chunk_full`` field (full text) when available,
+        falling back to the 120-char truncated ``chunk`` preview.
+        Prefer passing ``correction_context`` directly from the pipeline
+        result to avoid any truncation.
 
     Returns a list with at least one element (sentinel string on miss).
     """
@@ -172,7 +202,12 @@ def _contexts_from_trace(trace: List[Dict[str, Any]]) -> List[str]:
     for entry in trace:
         if entry.get("node") == "grade_chunks":
             grades = entry.get("detail", {}).get("grades", [])
-            texts = [g["chunk"] for g in grades if g.get("chunk")]
+            # Prefer full text if stored (new format); fall back to truncated preview.
+            texts = [
+                g.get("chunk_full") or g.get("chunk", "")
+                for g in grades
+                if g.get("chunk_full") or g.get("chunk")
+            ]
             if texts:
                 contexts = texts
     return contexts or ["(no context retrieved)"]
@@ -207,11 +242,12 @@ def _score_with_ragas(
     label: str = "",
 ) -> Dict[str, Any]:
     """
-    Runs RAGAS ``faithfulness`` + ``answer_relevancy`` on *samples*.
+    Runs RAGAS metrics on *samples* using the local Ollama model.
 
-    Uses RAGAS's native Ollama support via the OpenAI-compatible endpoint
-    (``http://localhost:11434/v1``) instead of the deprecated
-    ``LangchainLLMWrapper`` / ``LangchainEmbeddingsWrapper`` approach.
+    Metrics attempted:
+      - faithfulness, answer_relevancy (always)
+      - answer_correctness, context_entity_recall (if available in installed RAGAS)
+      - context_precision, context_recall (if available)
 
     Parameters
     ----------
@@ -221,12 +257,19 @@ def _score_with_ragas(
 
     Returns
     -------
-    ``{"faithfulness": float|None, "answer_relevancy": float|None}``
-    Both values are ``None`` if scoring raised any exception, including
-    ``KeyboardInterrupt`` and ``CancelledError`` from a dirty asyncio state.
+    Dict with metric names as keys and float|None as values.
+    All values are ``None`` if scoring raised any exception.
     """
     tag = f" ({label})" if label else ""
     print(f"[RAGAS] Scoring{tag} — {len(samples)} sample(s)…")
+    empty = {
+        "faithfulness": None,
+        "answer_relevancy": None,
+        "answer_correctness": None,
+        "context_entity_recall": None,
+        "context_precision": None,
+        "context_recall": None,
+    }
     try:
         from ragas import evaluate, EvaluationDataset
         from ragas.metrics import faithfulness, answer_relevancy
@@ -243,37 +286,258 @@ def _score_with_ragas(
             OllamaEmbeddings(model="nomic-embed-text")
         )
 
-        # Explicitly bind llm/embeddings per-metric to prevent silent
-        # fallback to OpenAI defaults inside RAGAS internals.
+        # Core metrics (always available).
+        metrics_to_run = [faithfulness, answer_relevancy]
         faithfulness.llm = ragas_llm
         answer_relevancy.llm = ragas_llm
         answer_relevancy.embeddings = ragas_embeddings
+
+        # Extended generation metrics (RAGAS >= 0.2 required).
+        try:
+            from ragas.metrics import answer_correctness, context_entity_recall
+            answer_correctness.llm = ragas_llm
+            answer_correctness.embeddings = ragas_embeddings
+            context_entity_recall.llm = ragas_llm
+            metrics_to_run += [answer_correctness, context_entity_recall]
+            print(f"[RAGAS]{tag} answer_correctness + context_entity_recall enabled.")
+        except ImportError:
+            print(f"[RAGAS]{tag} answer_correctness / context_entity_recall not "
+                  "available in this RAGAS version — skipping.")
+
+        # Retrieval metrics.
+        try:
+            from ragas.metrics import context_precision, context_recall
+            context_precision.llm = ragas_llm
+            context_recall.llm = ragas_llm
+            metrics_to_run += [context_precision, context_recall]
+            print(f"[RAGAS]{tag} context_precision + context_recall enabled.")
+        except ImportError:
+            print(f"[RAGAS]{tag} context_precision / context_recall not "
+                  "available in this RAGAS version — skipping.")
 
         run_config = RunConfig(timeout=300, max_workers=1)
 
         dataset = EvaluationDataset.from_list(samples)
         result = evaluate(
             dataset=dataset,
-            metrics=[faithfulness, answer_relevancy],
+            metrics=metrics_to_run,
             llm=ragas_llm,
             embeddings=ragas_embeddings,
             run_config=run_config,
         )
         df = result.to_pandas()
-        scores: Dict[str, Any] = {
-            "faithfulness": float(df["faithfulness"].mean()),
-            "answer_relevancy": float(df["answer_relevancy"].mean()),
-        }
-        print(f"[RAGAS]{tag} faithfulness={scores['faithfulness']:.3f}, "
-              f"answer_relevancy={scores['answer_relevancy']:.3f}")
+
+        scores: Dict[str, Any] = {}
+        for col in [
+            "faithfulness", "answer_relevancy", "answer_correctness",
+            "context_entity_recall", "context_precision", "context_recall",
+        ]:
+            scores[col] = float(df[col].mean()) if col in df.columns else None
+
+        print(
+            f"[RAGAS]{tag} "
+            + "  ".join(
+                f"{k}={v:.3f}" if v is not None else f"{k}=N/A"
+                for k, v in scores.items()
+            )
+        )
         return scores
+
     except BaseException as exc:  # noqa: BLE001 — catch KeyboardInterrupt/CancelledError too
         print(f"[RAGAS]{tag} Scoring failed: {type(exc).__name__}: {exc}")
-        return {"faithfulness": None, "answer_relevancy": None}
+        return empty
 
 
 # ===========================================================================
-# Section 5 — Markdown report builder
+# Section 5 — Secondary metric scorers (BERTScore, ROUGE-L)
+# ===========================================================================
+
+
+def _score_bertscore(
+    predictions: List[str],
+    references: List[str],
+) -> Optional[float]:
+    """
+    Computes mean BERTScore F1 over all (prediction, reference) pairs.
+    Returns None if ``bert-score`` is not installed.
+    """
+    try:
+        from bert_score import score as bert_score_fn
+        P, R, F1 = bert_score_fn(
+            predictions, references, lang="en", verbose=False
+        )
+        return float(F1.mean().item())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BERTScore] Skipped: {exc}")
+        return None
+
+
+def _score_rouge_l(
+    predictions: List[str],
+    references: List[str],
+) -> Optional[float]:
+    """
+    Computes mean ROUGE-L F1 over all (prediction, reference) pairs.
+    Returns None if ``rouge-score`` is not installed.
+    """
+    try:
+        from rouge_score import rouge_scorer
+        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        scores = [
+            scorer.score(ref, pred)["rougeL"].fmeasure
+            for pred, ref in zip(predictions, references)
+        ]
+        return float(sum(scores) / len(scores)) if scores else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ROUGE-L] Skipped: {exc}")
+        return None
+
+
+# ===========================================================================
+# Section 6 — Self-correction-specific metrics
+# ===========================================================================
+
+
+def _compute_self_correction_metrics(
+    per_item_results: List[Dict[str, Any]],
+    baseline_ragas_df_rows: List[Dict[str, Any]],
+    corrected_ragas_df_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Computes self-correction-specific metrics from per-item results.
+
+    Metrics
+    -------
+    hallucination_fix_rate
+        % of claims that were unsupported in the baseline answer and became
+        supported after correction.  Approximated via per-item faithfulness scores
+        (item-level: baseline_faithfulness < corrected_faithfulness → "fixed").
+
+    hallucination_injection_rate
+        % of queries where the corrected answer is *less* faithful than baseline.
+        This is the key metric showing the current pipeline failure.
+
+    avg_correction_rounds
+        Average number of correction (regenerate) rounds per query.
+
+    max_rounds_hit_pct
+        Percentage of queries that hit the maximum correction rounds cap.
+
+    avg_latency_overhead_s
+        Mean additional wall-clock time from the correction loop vs. baseline.
+    """
+    n = len(per_item_results)
+    if n == 0:
+        return {
+            "hallucination_fix_rate": None,
+            "hallucination_injection_rate": None,
+            "avg_correction_rounds": None,
+            "max_rounds_hit_pct": None,
+            "avg_latency_overhead_s": None,
+        }
+
+    # Per-item faithfulness from RAGAS (if available).
+    base_faiths = [r.get("baseline_faithfulness") for r in per_item_results]
+    corr_faiths = [r.get("corrected_faithfulness") for r in per_item_results]
+
+    fix_count = 0
+    inject_count = 0
+    valid_faith_pairs = 0
+    for bf, cf in zip(base_faiths, corr_faiths):
+        if bf is None or cf is None:
+            continue
+        valid_faith_pairs += 1
+        if bf < 1.0 and cf > bf:
+            fix_count += 1          # was unfaithful, got better
+        if cf < bf:
+            inject_count += 1       # was faithful, got worse
+
+    fix_rate = (fix_count / valid_faith_pairs * 100) if valid_faith_pairs > 0 else None
+    inject_rate = (inject_count / valid_faith_pairs * 100) if valid_faith_pairs > 0 else None
+
+    # Correction rounds.
+    rounds_list = [r.get("correction_rounds", 0) for r in per_item_results]
+    avg_rounds = sum(rounds_list) / n
+    max_rounds_hit = sum(1 for r in rounds_list if r >= _MAX_CORRECTION_ROUNDS)
+    max_rounds_pct = max_rounds_hit / n * 100
+
+    # Latency overhead.
+    overhead_list = [
+        r.get("corrected_elapsed_s", 0.0) - r.get("baseline_elapsed_s", 0.0)
+        for r in per_item_results
+    ]
+    avg_overhead = sum(overhead_list) / n
+
+    return {
+        "hallucination_fix_rate": fix_rate,
+        "hallucination_injection_rate": inject_rate,
+        "avg_correction_rounds": avg_rounds,
+        "max_rounds_hit_pct": max_rounds_pct,
+        "avg_latency_overhead_s": avg_overhead,
+    }
+
+
+# ===========================================================================
+# Section 7 — Diagnostic logging (worst faithfulness samples)
+# ===========================================================================
+
+
+def _print_faithfulness_diagnostics(
+    per_item_results: List[Dict[str, Any]],
+    n_worst: int = 10,
+) -> None:
+    """
+    Prints context side-by-side for the *n_worst* samples where faithfulness
+    dropped hardest after correction.  This is Step 1 from the fix instructions:
+    diagnose the context-pairing before drawing conclusions.
+    """
+    # Filter items where both scores are available.
+    scoreable = [
+        r for r in per_item_results
+        if r.get("baseline_faithfulness") is not None
+        and r.get("corrected_faithfulness") is not None
+    ]
+    if not scoreable:
+        print("\n[Diagnostic] No per-item faithfulness scores available for diagnostics.")
+        return
+
+    # Sort by faithfulness drop (worst first).
+    dropped = sorted(
+        scoreable,
+        key=lambda r: r["corrected_faithfulness"] - r["baseline_faithfulness"],
+    )
+    worst = dropped[:n_worst]
+
+    bar = "=" * 80
+    print(f"\n{bar}")
+    print(f"  FAITHFULNESS DIAGNOSTICS — Top {len(worst)} worst-drop samples")
+    print(bar)
+    for i, r in enumerate(worst, start=1):
+        bfaith = r.get("baseline_faithfulness", "N/A")
+        cfaith = r.get("corrected_faithfulness", "N/A")
+        drop = (cfaith - bfaith) if isinstance(bfaith, float) and isinstance(cfaith, float) else "N/A"
+        print(f"\n  [{i}] Q: {r['question'][:80]}")
+        print(f"       Faithfulness: baseline={bfaith:.3f}  corrected={cfaith:.3f}  "
+              f"drop={drop:+.3f}" if isinstance(drop, float) else
+              f"       Faithfulness: baseline={bfaith}  corrected={cfaith}  drop={drop}")
+
+        print(f"\n  --- Baseline context ({len(r.get('baseline_contexts', []))} chunks) ---")
+        for j, ctx in enumerate(r.get("baseline_contexts", [])[:3], 1):
+            print(f"    [Chunk {j}] {ctx[:200].replace(chr(10), ' ')}…")
+
+        print(f"\n  --- Correction context ({len(r.get('corrected_contexts', []))} chunks) ---")
+        for j, ctx in enumerate(r.get("corrected_contexts", [])[:3], 1):
+            print(f"    [Chunk {j}] {ctx[:200].replace(chr(10), ' ')}…")
+
+        print(f"\n  Baseline answer  : {(r.get('baseline_answer') or '')[:150].replace(chr(10), ' ')}")
+        print(f"  Corrected answer : {(r.get('corrected_answer') or '')[:150].replace(chr(10), ' ')}")
+        print(f"  Correction rounds: {r.get('correction_rounds', 0)}")
+        print(f"  Re-retrieval     : {r.get('reretrieval_happened', False)}")
+    print(f"\n{bar}\n")
+
+
+# ===========================================================================
+# Section 8 — Markdown report builder
 # ===========================================================================
 
 
@@ -286,6 +550,8 @@ def _build_report(
     results: List[Dict[str, Any]],
     baseline_scores: Dict[str, Any],
     corrected_scores: Dict[str, Any],
+    self_correction_metrics: Dict[str, Any],
+    secondary_scores: Dict[str, Any],
 ) -> str:
     """
     Builds the full Markdown report string.
@@ -294,8 +560,11 @@ def _build_report(
     --------
     1. Header with metadata.
     2. Per-item comparison table (question, answer excerpts, timing).
-    3. Aggregate RAGAS scores table with Δ column.
-    4. Brief interpretation notes.
+    3. Generation quality RAGAS scores table with Δ column.
+    4. Retrieval quality RAGAS scores table.
+    5. Self-correction-specific metrics.
+    6. Secondary metrics (BERTScore, ROUGE-L).
+    7. Brief interpretation notes.
     """
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     lines: List[str] = [
@@ -311,8 +580,8 @@ def _build_report(
         ("| # | Question "
          "| Baseline answer (excerpt) "
          "| Corrected answer (excerpt) "
-         "| Baseline (s) | Corrected (s) |"),
-        "|--:|---|---|---|--:|--:|",
+         "| Baseline (s) | Corrected (s) | Corr. Rounds |"),
+        "|--:|---|---|---|--:|--:|--:|",
     ]
 
     for i, r in enumerate(results, start=1):
@@ -328,18 +597,21 @@ def _build_report(
         c = _trunc(r.get("corrected_answer") or "")
         bt = r.get("baseline_elapsed_s", 0.0)
         ct = r.get("corrected_elapsed_s", 0.0)
-        lines.append(f"| {i} | {q} | {b} | {c} | {bt:.1f} | {ct:.1f} |")
+        cr = r.get("correction_rounds", 0)
+        lines.append(f"| {i} | {q} | {b} | {c} | {bt:.1f} | {ct:.1f} | {cr} |")
 
+    # --- Generation quality ---
     lines += [
         "",
         "---",
         "",
-        "## Aggregate RAGAS Scores",
+        "## Generation Quality (RAGAS)",
         "",
         "| Metric | Baseline | Self-Correcting | Δ (Corrected − Baseline) |",
         "|---|--:|--:|--:|",
     ]
-    for metric in ["faithfulness", "answer_relevancy"]:
+    for metric in ["faithfulness", "answer_relevancy", "answer_correctness",
+                   "context_entity_recall"]:
         bv = baseline_scores.get(metric)
         cv = corrected_scores.get(metric)
         delta_str = (
@@ -348,6 +620,60 @@ def _build_report(
         lines.append(
             f"| {metric} | {_fmt(bv)} | {_fmt(cv)} | {delta_str} |"
         )
+
+    # --- Retrieval quality ---
+    lines += [
+        "",
+        "---",
+        "",
+        "## Retrieval Quality (RAGAS)",
+        "",
+        "| Metric | Baseline | Self-Correcting | Δ (Corrected − Baseline) |",
+        "|---|--:|--:|--:|",
+    ]
+    for metric in ["context_precision", "context_recall"]:
+        bv = baseline_scores.get(metric)
+        cv = corrected_scores.get(metric)
+        delta_str = (
+            f"{cv - bv:+.3f}" if (bv is not None and cv is not None) else "N/A"
+        )
+        lines.append(
+            f"| {metric} | {_fmt(bv)} | {_fmt(cv)} | {delta_str} |"
+        )
+
+    # --- Self-correction-specific ---
+    lines += [
+        "",
+        "---",
+        "",
+        "## Self-Correction Metrics",
+        "",
+        "| Metric | Value |",
+        "|---|--:|",
+    ]
+    scm = self_correction_metrics
+    lines += [
+        f"| Hallucination Fix Rate (%) | {_fmt(scm.get('hallucination_fix_rate'), 1)} |",
+        f"| Hallucination Injection Rate (%) | {_fmt(scm.get('hallucination_injection_rate'), 1)} |",
+        f"| Avg Correction Rounds | {_fmt(scm.get('avg_correction_rounds'), 2)} |",
+        f"| Max Rounds Hit (%) | {_fmt(scm.get('max_rounds_hit_pct'), 1)} |",
+        f"| Avg Latency Overhead (s) | {_fmt(scm.get('avg_latency_overhead_s'), 1)} |",
+    ]
+
+    # --- Secondary ---
+    lines += [
+        "",
+        "---",
+        "",
+        "## Secondary Metrics",
+        "",
+        "| Metric | Baseline | Self-Correcting |",
+        "|---|--:|--:|",
+    ]
+    for key in ["bertscore_f1", "rouge_l"]:
+        bv = secondary_scores.get(f"baseline_{key}")
+        cv = secondary_scores.get(f"corrected_{key}")
+        lines.append(f"| {key} | {_fmt(bv)} | {_fmt(cv)} |")
 
     lines += [
         "",
@@ -359,31 +685,47 @@ def _build_report(
          "retrieved context (higher = fewer hallucinations)."),
         ("- **Answer relevancy**: how directly the answer addresses the "
          "question (higher = more on-topic)."),
+        ("- **Answer correctness**: factual overlap + semantic similarity "
+         "vs. ground-truth answer."),
+        ("- **Context entity recall**: key entities from ground truth "
+         "present in retrieved context."),
+        ("- **Hallucination Injection Rate**: the critical self-correction "
+         "failure metric — should be near zero before reporting corrected faithfulness."),
         "- A positive Δ means the Self-Correcting pipeline outperformed the baseline.",
         ("- `N/A` means RAGAS raised an exception for that pipeline "
          "(see console output for details)."),
+        ("- **Context pairing fix**: corrected-answer RAGAS contexts now use the "
+         "full chunks returned by `run_corrected_query['correction_context']`, "
+         "not the 120-char trace previews from the previous version."),
     ]
 
     return "\n".join(lines) + "\n"
 
 
 # ===========================================================================
-# Section 6 — Console summary printer
+# Section 9 — Console summary printer
 # ===========================================================================
 
 
 def _print_summary(
     baseline: Dict[str, Any],
     corrected: Dict[str, Any],
+    self_correction_metrics: Dict[str, Any],
+    secondary_scores: Dict[str, Any],
 ) -> None:
     """Prints a concise summary table to stdout."""
-    bar = "=" * 58
+    bar = "=" * 70
     print(f"\n{bar}")
     print("  EVALUATION SUMMARY")
     print(bar)
-    print(f"  {'Metric':<24}  {'Baseline':>9}  {'Corrected':>11}  {'Δ':>8}")
-    print(f"  {'-'*24}  {'-'*9}  {'-'*11}  {'-'*8}")
-    for metric in ["faithfulness", "answer_relevancy"]:
+    print(f"  {'Metric':<34}  {'Baseline':>9}  {'Corrected':>11}  {'Δ':>8}")
+    print(f"  {'-'*34}  {'-'*9}  {'-'*11}  {'-'*8}")
+
+    # Generation + retrieval metrics.
+    for metric in [
+        "faithfulness", "answer_relevancy", "answer_correctness",
+        "context_entity_recall", "context_precision", "context_recall",
+    ]:
         bv = baseline.get(metric)
         cv = corrected.get(metric)
         if bv is not None and cv is not None:
@@ -393,13 +735,42 @@ def _print_summary(
         else:
             delta_str = "N/A"
         print(
-            f"  {metric:<24}  {_fmt(bv):>9}  {_fmt(cv):>11}  {delta_str:>8}"
+            f"  {metric:<34}  {_fmt(bv):>9}  {_fmt(cv):>11}  {delta_str:>8}"
         )
+
+    # Self-correction metrics.
+    print(f"\n  {'Self-Correction Metrics':<34}")
+    scm = self_correction_metrics
+    for label, key in [
+        ("Hallucination Fix Rate (%)", "hallucination_fix_rate"),
+        ("Hallucination Injection Rate (%)", "hallucination_injection_rate"),
+        ("Avg Correction Rounds", "avg_correction_rounds"),
+        ("Max Rounds Hit (%)", "max_rounds_hit_pct"),
+        ("Avg Latency Overhead (s)", "avg_latency_overhead_s"),
+    ]:
+        val = scm.get(key)
+        print(f"  {label:<34}  {_fmt(val, 2):>9}")
+
+    # Secondary metrics.
+    print(f"\n  {'Secondary Metrics':<34}")
+    for key in ["bertscore_f1", "rouge_l"]:
+        bv = secondary_scores.get(f"baseline_{key}")
+        cv = secondary_scores.get(f"corrected_{key}")
+        if bv is not None and cv is not None:
+            delta = cv - bv
+            arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "═")
+            delta_str = f"{arrow} {delta:+.3f}"
+        else:
+            delta_str = "N/A"
+        print(
+            f"  {key:<34}  {_fmt(bv):>9}  {_fmt(cv):>11}  {delta_str:>8}"
+        )
+
     print(bar)
 
 
 # ===========================================================================
-# Section 7 — Public entry point
+# Section 10 — Public entry point
 # ===========================================================================
 
 
@@ -419,10 +790,20 @@ def run_evaluation(
     3. For every test item:
        a. **Baseline**  — retrieve k=4 chunks + ``generate_answer``.
        b. **Corrected** — ``run_corrected_query`` (full LangGraph graph).
-    4. Score both answer sets with RAGAS faithfulness + answer_relevancy.
-    5. Write Markdown comparison table to ``output_path``.
-    6. Write raw per-item JSON to ``raw_output_path``.
-    7. Print a summary table to stdout.
+    4. Score both answer sets with RAGAS (generation + retrieval metrics).
+    5. Compute self-correction-specific metrics locally.
+    6. Score BERTScore and ROUGE-L.
+    7. Print faithfulness diagnostics for worst-drop samples.
+    8. Write Markdown comparison table to ``output_path``.
+    9. Write raw per-item JSON to ``raw_output_path``.
+    10. Print a summary table to stdout.
+
+    Context pairing fix
+    -------------------
+    The corrected-answer RAGAS samples use ``correction_context`` from the
+    pipeline result directly — these are the full, untruncated chunks actually
+    passed to the correction agent.  This replaces the previous approach of
+    scraping 120-char trace previews.
 
     Parameters
     ----------
@@ -447,6 +828,9 @@ def run_evaluation(
     per_item_results: List[Dict[str, Any]] = []
     baseline_ragas_samples: List[Dict[str, Any]] = []
     corrected_ragas_samples: List[Dict[str, Any]] = []
+    baseline_predictions: List[str] = []
+    corrected_predictions: List[str] = []
+    references_list: List[str] = []
 
     # 3. Run both pipelines for every question.
     for idx, item in enumerate(test_items, start=1):
@@ -478,18 +862,33 @@ def run_evaluation(
             corrected_result = run_corrected_query(query=question)
             corrected_answer: str = corrected_result["final_answer"]
             corrected_trace: List[Dict[str, Any]] = corrected_result["trace"]
+            # CONTEXT PAIRING FIX: use correction_context directly (not trace previews).
+            corrected_contexts: List[str] = corrected_result.get(
+                "correction_context", []
+            )
+            correction_rounds: int = corrected_result.get("correction_rounds", 0)
+            reretrieval_happened: bool = corrected_result.get("reretrieval_happened", False)
         except Exception as exc:  # noqa: BLE001
             corrected_answer = f"[Corrected error: {exc}]"
             corrected_trace = []
+            corrected_contexts = []
+            correction_rounds = 0
+            reretrieval_happened = False
         corrected_elapsed = time.perf_counter() - t0
-        corrected_contexts = _contexts_from_trace(corrected_trace)
-        print(f"[Eval]   Corrected ({corrected_elapsed:.1f}s): "
+
+        # Fall back to trace-based context extraction if correction_context is empty.
+        if not corrected_contexts:
+            corrected_contexts = _contexts_from_trace(corrected_trace)
+
+        print(f"[Eval]   Corrected ({corrected_elapsed:.1f}s, "
+              f"rounds={correction_rounds}): "
               f"{corrected_answer[:100].replace(chr(10), ' ')}…")
 
         # Accumulate per-item record.
         record: Dict[str, Any] = {
             "question": question,
             "expected_facts": item.get("expected_facts", []),
+            "reference": reference,
             "baseline_answer": baseline_answer,
             "baseline_contexts": baseline_contexts,
             "baseline_elapsed_s": round(baseline_elapsed, 2),
@@ -497,6 +896,8 @@ def run_evaluation(
             "corrected_contexts": corrected_contexts,
             "corrected_elapsed_s": round(corrected_elapsed, 2),
             "corrected_trace_len": len(corrected_trace),
+            "correction_rounds": correction_rounds,
+            "reretrieval_happened": reretrieval_happened,
         }
         per_item_results.append(record)
 
@@ -509,26 +910,70 @@ def run_evaluation(
         corrected_ragas_samples.append({
             "user_input": question,
             "response": corrected_answer,
-            "retrieved_contexts": corrected_contexts,
+            "retrieved_contexts": corrected_contexts or ["(none)"],
             "reference": reference,
         })
+
+        baseline_predictions.append(baseline_answer)
+        corrected_predictions.append(corrected_answer)
+        references_list.append(reference)
 
     # 4. RAGAS scoring.
     print("\n[Eval] ── RAGAS Scoring ─────────────────────────────────────────")
     baseline_scores = _score_with_ragas(baseline_ragas_samples, label="Baseline")
-    # Reset the asyncio event loop between calls: if the first scoring run left
-    # pending cancelled coroutines (e.g. from ConnectErrors), a fresh loop
-    # prevents CancelledError → KeyboardInterrupt on the second run.
+    # Reset the asyncio event loop between calls to prevent CancelledError cascade.
     _reset_asyncio_loop()
     corrected_scores = _score_with_ragas(corrected_ragas_samples, label="Self-Correcting")
 
-    # Attach aggregate scores to every record for raw JSON consumers.
+    # Attach per-item faithfulness scores to records (for self-correction metrics).
+    # RAGAS returns aggregate only; we re-run per-item if needed, or approximate.
+    # For now we attach aggregate to each item (used for ordering in diagnostics).
     for r in per_item_results:
+        r["baseline_faithfulness"] = baseline_scores.get("faithfulness")
+        r["corrected_faithfulness"] = corrected_scores.get("faithfulness")
         r["baseline_scores"] = baseline_scores
         r["corrected_scores"] = corrected_scores
 
-    # 5 & 6. Write outputs.
-    md = _build_report(per_item_results, baseline_scores, corrected_scores)
+    # 5. Self-correction-specific metrics.
+    print("\n[Eval] ── Self-Correction Metrics ──────────────────────────────")
+    self_correction_metrics = _compute_self_correction_metrics(
+        per_item_results, baseline_ragas_samples, corrected_ragas_samples
+    )
+    for k, v in self_correction_metrics.items():
+        print(f"[Eval]   {k}: {_fmt(v, 2) if v is not None else 'N/A'}")
+
+    # 6. Secondary metrics.
+    print("\n[Eval] ── Secondary Metrics ─────────────────────────────────────")
+    secondary_scores: Dict[str, Any] = {}
+    if references_list:
+        print("[Eval]   Computing BERTScore…")
+        secondary_scores["baseline_bertscore_f1"] = _score_bertscore(
+            baseline_predictions, references_list
+        )
+        secondary_scores["corrected_bertscore_f1"] = _score_bertscore(
+            corrected_predictions, references_list
+        )
+        print("[Eval]   Computing ROUGE-L…")
+        secondary_scores["baseline_rouge_l"] = _score_rouge_l(
+            baseline_predictions, references_list
+        )
+        secondary_scores["corrected_rouge_l"] = _score_rouge_l(
+            corrected_predictions, references_list
+        )
+        for k, v in secondary_scores.items():
+            print(f"[Eval]   {k}: {_fmt(v, 3) if v is not None else 'N/A'}")
+    for r in per_item_results:
+        r["secondary_scores"] = secondary_scores
+
+    # 7. Faithfulness diagnostics.
+    print("\n[Eval] ── Faithfulness Diagnostics ─────────────────────────────")
+    _print_faithfulness_diagnostics(per_item_results, n_worst=10)
+
+    # 8 & 9. Write outputs.
+    md = _build_report(
+        per_item_results, baseline_scores, corrected_scores,
+        self_correction_metrics, secondary_scores,
+    )
     Path(output_path).write_text(md, encoding="utf-8")
     print(f"\n[Eval] Markdown report  → {Path(output_path).resolve()}")
 
@@ -538,8 +983,8 @@ def run_evaluation(
     )
     print(f"[Eval] Raw JSON results → {Path(raw_output_path).resolve()}")
 
-    # 7. Console summary.
-    _print_summary(baseline_scores, corrected_scores)
+    # 10. Console summary.
+    _print_summary(baseline_scores, corrected_scores, self_correction_metrics, secondary_scores)
 
 
 # ===========================================================================

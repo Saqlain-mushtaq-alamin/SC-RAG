@@ -24,16 +24,45 @@ Design decisions (approved in Phase 3a)
 - After exhausting retries the graph always proceeds to END with the best-effort
   answer rather than raising an error; the trace log records the struggle.
 
+Faithfulness Fix (Step 2)
+--------------------------
+- ``node_regenerate`` now uses a *hardened* system prompt that explicitly
+  forbids the model from introducing any claim not present in the provided
+  context — even if omitting it hurts fluency or completeness.
+- Correction is framed as *targeted claim-level patching* (remove unsupported
+  claims, keep supported ones verbatim) rather than a full answer regeneration,
+  so already-faithful claims are not disturbed.
+- The exact chunks used during correction are stored in ``correction_context``
+  and returned by ``run_corrected_query`` so the eval harness can do exact
+  context pairing (fixing the harness bug).
+
+Instrumentation (Step 3)
+-------------------------
+- ``per_claim_verdicts`` — per-claim faithfulness detail from ``grade_groundedness``.
+- ``correction_rounds`` — total correction (regenerate) rounds executed.
+- ``reretrieval_happened`` — True if a new ``retrieve`` cycle ran after the
+  initial generation (usefulness or retrieval retry).
+
 Public API
 ----------
     run_corrected_query(query: str) -> dict
-        {"final_answer": str, "trace": list[dict]}
+        {
+          "final_answer": str,
+          "trace": list[dict],
+          "correction_context": list[str],   # full chunks used in correction
+          "correction_rounds": int,
+          "reretrieval_happened": bool,
+        }
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, TypedDict
 
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.graders import (
@@ -50,6 +79,8 @@ from src.agents.falsifier import (
 from src.retrieval.document_store import DocumentStore
 from src.retrieval.embedding_index import EmbeddingIndex
 from src.retrieval.generator import generate_answer
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Retry caps (named constants — change here only)
@@ -69,6 +100,7 @@ _retrieval_grader: RetrievalGrader | None = None
 _groundedness_grader: AnswerGroundednessGrader | None = None
 _usefulness_grader: AnswerUsefulnessGrader | None = None
 _query_rewriter: QueryRewriter | None = None
+_correction_llm: ChatOllama | None = None
 
 
 def _get_index() -> EmbeddingIndex:
@@ -111,6 +143,92 @@ def _get_query_rewriter() -> QueryRewriter:
     return _query_rewriter
 
 
+def _get_correction_llm() -> ChatOllama:
+    """Returns a cached ChatOllama instance used exclusively for correction."""
+    global _correction_llm
+    if _correction_llm is None:
+        _correction_llm = ChatOllama(
+            model=os.environ.get("OLLAMA_MODEL", "qwen3-vl:8b-instruct-q8_0"),
+            base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            temperature=0.0,
+        )
+    return _correction_llm
+
+
+# ---------------------------------------------------------------------------
+# Hardened correction system prompt (Step 2)
+# ---------------------------------------------------------------------------
+
+_CORRECTION_SYSTEM = """\
+You are a strict faithfulness editor for a retrieval-augmented generation (RAG) system.
+
+Your ONLY job is to remove or soften claims in the ORIGINAL ANSWER that are NOT
+supported by the CONTEXT provided below.
+
+ABSOLUTE RULES — violating any of these is a critical failure:
+1. Every factual claim in your revised answer MUST be directly supported by the
+   CONTEXT below.  If you cannot find support, REMOVE the claim entirely rather
+   than rephrasing or hedging it.
+2. Do NOT add any information that does not appear in the CONTEXT — not even
+   reasonable inferences, background knowledge, or fluency improvements.
+3. Do NOT use your own parametric/world knowledge.  Treat every fact outside the
+   CONTEXT as non-existent.
+4. Do NOT rewrite or restructure sentences that are already supported — copy them
+   verbatim or make only the minimal change required.
+5. If removing the unsupported claims leaves a correct, shorter answer, that is
+   the right output.  Do not pad.
+
+Approach:
+- Read each sentence/claim in the ORIGINAL ANSWER.
+- Check whether the CONTEXT supports it.
+- Keep it if supported; remove (or soften to "not mentioned in context") if not.
+- Return the corrected answer only — no preamble, no explanation, no meta-commentary.\
+"""
+
+
+def _generate_corrected_answer(
+    original_query: str,
+    original_answer: str,
+    relevant_chunks: List[str],
+    unsupported_claims: List[str],
+) -> str:
+    """
+    Targeted claim-level correction: removes unsupported claims while leaving
+    supported claims intact.  Uses the hardened ``_CORRECTION_SYSTEM`` prompt
+    that explicitly forbids parametric knowledge injection.
+
+    Args:
+        original_query:    The user's original question.
+        original_answer:   The draft answer from the previous generation round.
+        relevant_chunks:   The full context chunks (not truncated) that were used
+                           for generation.  Passed to the correction LLM as the
+                           sole allowed source of facts.
+        unsupported_claims: Claims flagged by the groundedness grader.
+
+    Returns:
+        A corrected answer string with unsupported claims removed/softened.
+    """
+    numbered_chunks = "\n\n".join(
+        f"[CHUNK {i + 1}]\n{chunk}" for i, chunk in enumerate(relevant_chunks)
+    )
+    claims_block = "\n".join(f"  - {c}" for c in unsupported_claims)
+
+    user_content = (
+        f"QUESTION: {original_query}\n\n"
+        f"CONTEXT:\n{numbered_chunks}\n\n"
+        f"ORIGINAL ANSWER:\n{original_answer}\n\n"
+        f"CLAIMS FLAGGED AS UNSUPPORTED (remove these):\n{claims_block}\n\n"
+        "Produce the corrected answer now:"
+    )
+
+    messages = [
+        SystemMessage(content=_CORRECTION_SYSTEM),
+        HumanMessage(content=user_content),
+    ]
+    response = _get_correction_llm().invoke(messages)
+    return response.content.strip()
+
+
 # ---------------------------------------------------------------------------
 # GraphState
 # ---------------------------------------------------------------------------
@@ -135,9 +253,14 @@ class GraphState(TypedDict, total=False):
     draft_answer            Current candidate answer; overwritten each generate cycle.
     final_answer            Copied from draft_answer when the graph reaches END.
     unsupported_claims      Claims flagged by the last ``grade_groundedness`` call.
+    per_claim_verdicts      Detailed per-claim faithfulness log from groundedness grader.
     retrieval_retry_count   rewrite_query→retrieve cycles completed (cap: 2).
     groundedness_retry_count  regenerate cycles completed (cap: 2).
     usefulness_retry_count  Usefulness-driven full cycles completed (cap: 1).
+    correction_rounds       Total correction (regenerate) rounds executed.
+    correction_context      Full chunk texts used during correction — returned to
+                            the eval harness for exact RAGAS context pairing.
+    reretrieval_happened    True if a second retrieve cycle ran after generation.
     trace                   Chronological log of every node visit and decision.
     """
 
@@ -155,11 +278,17 @@ class GraphState(TypedDict, total=False):
     draft_answer: str
     final_answer: str
     unsupported_claims: List[str]
+    per_claim_verdicts: List[Dict[str, Any]]  # per-claim faithfulness detail
 
     # --- retry counters (incremented inside action nodes) ---
     retrieval_retry_count: int
     groundedness_retry_count: int
     usefulness_retry_count: int
+
+    # --- instrumentation ---
+    correction_rounds: int        # total regenerate rounds executed
+    correction_context: List[str] # full chunks used in correction (for eval)
+    reretrieval_happened: bool    # True if a new retrieve cycle ran post-generation
 
     # --- falsification (optional, gated by ENABLE_FALSIFICATION) ---
     falsification_done: bool   # True once the single allowed round has run
@@ -197,8 +326,8 @@ def node_retrieve(state: GraphState) -> Dict[str, Any]:
     """
     Embeds the current query and retrieves the top-k chunks from the FAISS index.
 
-    Reads:  ``query``
-    Writes: ``retrieved_chunks``, ``trace``
+    Reads:  ``query``, ``draft_answer`` (to detect post-generation re-retrieval)
+    Writes: ``retrieved_chunks``, ``reretrieval_happened``, ``trace``
     """
     query = state["query"]
     index = _get_index()
@@ -208,15 +337,27 @@ def node_retrieve(state: GraphState) -> Dict[str, Any]:
     chunks = [item[0]["text"] if isinstance(item[0], dict) else str(item[0])
               for item in results]
 
+    # Flag re-retrieval if generation has already happened.
+    reretrieval_happened = state.get("reretrieval_happened", False)
+    if state.get("draft_answer"):
+        reretrieval_happened = True
+
     trace = list(state.get("trace", []))
     trace.append(_trace_entry(
         node="retrieve",
         query=query,
         decision=f"Retrieved {len(chunks)} chunks from index.",
-        detail={"num_chunks": len(chunks)},
+        detail={
+            "num_chunks": len(chunks),
+            "reretrieval": reretrieval_happened,
+        },
     ))
 
-    return {"retrieved_chunks": chunks, "trace": trace}
+    return {
+        "retrieved_chunks": chunks,
+        "reretrieval_happened": reretrieval_happened,
+        "trace": trace,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +385,7 @@ def node_grade_chunks(state: GraphState) -> Dict[str, Any]:
         result = grader.grade(query=query, chunk=chunk)
         grades.append({
             "chunk": chunk[:120] + ("…" if len(chunk) > 120 else ""),
+            "chunk_full": chunk,  # full text preserved for eval context pairing
             "relevant": result.relevant,
             "reason": result.reason,
         })
@@ -342,10 +484,12 @@ def node_rewrite_query(state: GraphState) -> Dict[str, Any]:
 
 def node_generate(state: GraphState) -> Dict[str, Any]:
     """
-    Generates a draft answer from the relevant chunks using Claude Sonnet.
+    Generates a draft answer from the relevant chunks using the local LLM.
+    Also initialises ``correction_context`` to the current relevant chunks
+    so it is always populated even if no correction round runs.
 
     Reads:  ``original_query``, ``relevant_chunks``
-    Writes: ``draft_answer``, ``trace``
+    Writes: ``draft_answer``, ``correction_context``, ``trace``
     """
     original_query = state["original_query"]
     relevant_chunks = state.get("relevant_chunks", [])
@@ -357,6 +501,11 @@ def node_generate(state: GraphState) -> Dict[str, Any]:
     ]
     draft = generate_answer(query=original_query, chunks=chunk_dicts)
 
+    # Store full chunks as correction_context baseline (overwritten in node_regenerate).
+    full_chunks = [
+        c["text"] if isinstance(c, dict) else str(c) for c in relevant_chunks
+    ]
+
     trace = list(state.get("trace", []))
     trace.append(_trace_entry(
         node="generate",
@@ -365,7 +514,11 @@ def node_generate(state: GraphState) -> Dict[str, Any]:
         detail={"draft_preview": draft[:200]},
     ))
 
-    return {"draft_answer": draft, "trace": trace}
+    return {
+        "draft_answer": draft,
+        "correction_context": full_chunks,
+        "trace": trace,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +529,10 @@ def node_generate(state: GraphState) -> Dict[str, Any]:
 def node_grade_groundedness(state: GraphState) -> Dict[str, Any]:
     """
     Checks whether every factual claim in the draft answer is supported by the
-    retrieved context chunks.
+    retrieved context chunks.  Logs per-claim verdicts for instrumentation.
 
     Reads:  ``draft_answer``, ``relevant_chunks``
-    Writes: ``unsupported_claims``, ``trace``
+    Writes: ``unsupported_claims``, ``per_claim_verdicts``, ``trace``
     """
     draft = state.get("draft_answer", "")
     relevant_chunks = state.get("relevant_chunks", [])
@@ -390,6 +543,12 @@ def node_grade_groundedness(state: GraphState) -> Dict[str, Any]:
         for c in relevant_chunks
     ]
     result = grader.grade(answer=draft, chunks=chunk_texts)
+
+    # Build per-claim verdict records for instrumentation.
+    per_claim_verdicts: List[Dict[str, Any]] = []
+    for claim in result.unsupported_claims:
+        per_claim_verdicts.append({"claim": claim, "verdict": "unsupported"})
+    # Note: RAGAS faithfulness tracks claim-level; we record unsupported ones.
 
     decision = (
         "Answer is grounded. → grade_usefulness"
@@ -408,62 +567,88 @@ def node_grade_groundedness(state: GraphState) -> Dict[str, Any]:
         detail={
             "grounded": result.grounded,
             "unsupported_claims": result.unsupported_claims,
+            "per_claim_verdicts": per_claim_verdicts,
+            "context_chunk_count": len(chunk_texts),
         },
     ))
 
-    return {"unsupported_claims": result.unsupported_claims, "trace": trace}
+    return {
+        "unsupported_claims": result.unsupported_claims,
+        "per_claim_verdicts": per_claim_verdicts,
+        "trace": trace,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Node: regenerate
+# Node: regenerate  (FIXED — targeted claim-patching, hardened prompt)
 # ---------------------------------------------------------------------------
 
 
 def node_regenerate(state: GraphState) -> Dict[str, Any]:
     """
-    Re-generates the answer with an explicit instruction to avoid the previously
-    flagged unsupported claims. Increments ``groundedness_retry_count``.
+    Corrects the answer using *targeted claim-level patching*:
 
-    Reads:  ``original_query``, ``relevant_chunks``, ``unsupported_claims``
-    Writes: ``draft_answer``, ``groundedness_retry_count``, ``trace``
+    - Only the claims flagged as unsupported are removed/softened.
+    - Supported claims are kept verbatim — the model is NOT allowed to rewrite
+      unrelated sentences.
+    - The hardened ``_CORRECTION_SYSTEM`` prompt explicitly forbids adding any
+      information not present in the context (fixing the grounding/faithfulness
+      collapse bug).
+    - The exact chunks used are stored in ``correction_context`` so the eval
+      harness can do exact RAGAS context pairing (fixing the context-pairing bug).
+
+    Increments ``groundedness_retry_count`` and ``correction_rounds``.
+
+    Reads:  ``original_query``, ``relevant_chunks``, ``unsupported_claims``,
+            ``draft_answer``
+    Writes: ``draft_answer``, ``correction_context``, ``groundedness_retry_count``,
+            ``correction_rounds``, ``trace``
     """
     original_query = state["original_query"]
     relevant_chunks = state.get("relevant_chunks", [])
     unsupported_claims = state.get("unsupported_claims", [])
+    original_answer = state.get("draft_answer", "")
+
     groundedness_retry_count = state.get("groundedness_retry_count", 0) + 1
+    correction_rounds = state.get("correction_rounds", 0) + 1
 
-    # Build an augmented query that instructs the generator to exclude flagged claims.
-    exclusion_note = (
-        "\n\nIMPORTANT: Do NOT include or imply any of the following claims "
-        "which are NOT supported by the provided context:\n"
-        + "\n".join(f"  - {c}" for c in unsupported_claims)
-    )
-    augmented_query = original_query + exclusion_note
-
-    chunk_dicts = [
-        c if isinstance(c, dict) else {"text": c}
+    # Extract full text from chunk dicts.
+    chunk_texts = [
+        c["text"] if isinstance(c, dict) else str(c)
         for c in relevant_chunks
     ]
-    draft = generate_answer(query=augmented_query, chunks=chunk_dicts)
+
+    # Targeted correction using hardened prompt — no full regeneration.
+    corrected = _generate_corrected_answer(
+        original_query=original_query,
+        original_answer=original_answer,
+        relevant_chunks=chunk_texts,
+        unsupported_claims=unsupported_claims,
+    )
 
     trace = list(state.get("trace", []))
     trace.append(_trace_entry(
         node="regenerate",
         query=original_query,
         decision=(
-            f"Regenerated answer (groundedness retry #{groundedness_retry_count}). "
-            f"Excluded {len(unsupported_claims)} claim(s)."
+            f"Targeted correction (round #{correction_rounds}). "
+            f"Removed/softened {len(unsupported_claims)} unsupported claim(s). "
+            f"groundedness_retry={groundedness_retry_count}."
         ),
         detail={
             "groundedness_retry_count": groundedness_retry_count,
+            "correction_rounds": correction_rounds,
             "excluded_claims": unsupported_claims,
-            "draft_preview": draft[:200],
+            "context_chunk_count": len(chunk_texts),
+            "draft_preview": corrected[:200],
         },
     ))
 
     return {
-        "draft_answer": draft,
+        "draft_answer": corrected,
+        "correction_context": chunk_texts,   # exact chunks used for this correction
         "groundedness_retry_count": groundedness_retry_count,
+        "correction_rounds": correction_rounds,
         "trace": trace,
     }
 
@@ -716,11 +901,12 @@ def run_corrected_query(query: str) -> Dict[str, Any]:
       2. Grades chunks for relevance; rewrites the query if < 50% are relevant
          (up to 2 retries).
       3. Generates a draft answer from relevant chunks.
-      4. Grades the answer for groundedness; regenerates excluding unsupported
-         claims if needed (up to 2 retries).
+      4. Grades the answer for groundedness; applies targeted claim-level
+         correction using the hardened prompt if needed (up to 2 retries).
       5. Grades the answer for usefulness; rewrites the query and restarts the
          full cycle if the answer is unhelpful (up to 1 retry).
-      6. Returns the best-effort final answer with a full decision trace.
+      6. Returns the best-effort final answer with a full decision trace and
+         instrumentation data.
 
     Args:
         query: The user's natural-language query string.
@@ -730,6 +916,13 @@ def run_corrected_query(query: str) -> Dict[str, Any]:
         - ``"final_answer"`` (str): The best answer the system could produce.
         - ``"trace"`` (list[dict]): Chronological log of every node visit,
           routing decision, and grading result.
+        - ``"correction_context"`` (list[str]): Full chunk texts used during
+          the correction step — use these (not trace previews) for RAGAS
+          faithfulness scoring to ensure exact context pairing.
+        - ``"correction_rounds"`` (int): Number of correction (regenerate)
+          rounds executed (0 if no correction was needed).
+        - ``"reretrieval_happened"`` (bool): True if a second retrieve cycle
+          ran after the initial generation.
 
     Note:
         If retrieval, generation, or grading raise exceptions (e.g. API errors),
@@ -745,9 +938,13 @@ def run_corrected_query(query: str) -> Dict[str, Any]:
         "draft_answer": "",
         "final_answer": "",
         "unsupported_claims": [],
+        "per_claim_verdicts": [],
         "retrieval_retry_count": 0,
         "groundedness_retry_count": 0,
         "usefulness_retry_count": 0,
+        "correction_rounds": 0,
+        "correction_context": [],
+        "reretrieval_happened": False,
         "falsification_done": False,
         "trace": [],
     }
@@ -757,4 +954,7 @@ def run_corrected_query(query: str) -> Dict[str, Any]:
     return {
         "final_answer": final_state.get("draft_answer", ""),
         "trace": final_state.get("trace", []),
+        "correction_context": final_state.get("correction_context", []),
+        "correction_rounds": final_state.get("correction_rounds", 0),
+        "reretrieval_happened": final_state.get("reretrieval_happened", False),
     }
